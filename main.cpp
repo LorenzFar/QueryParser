@@ -3,12 +3,11 @@
 
 int main() {
     try {
-        Table customerTable("customer.parquet");
-        customerTable.displayTable();
+        Table table = Table("lineitem.parquet"); 
+        //std::cout << table.numRowGroups() << "\n";
+        table.printSchema();
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
         return 1;
     }
-
-    return 0;
 }
