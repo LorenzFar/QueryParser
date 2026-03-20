@@ -1,6 +1,7 @@
 #include "Table.h"
 #include <iostream>
 #include <stdexcept>
+#include <parquet/column_reader.h>
 #include <parquet/arrow/reader.h>
 #include <arrow/io/api.h>
 
@@ -9,14 +10,47 @@ Table::Table(const std::string& filename) {
     arrow::MemoryPool* pool = arrow::default_memory_pool();
 
     auto input_result = arrow::io::ReadableFile::Open(filename);
-    if (!input_result.ok()) throw std::runtime_error(input_result.status().ToString());
-    auto input = *input_result;
+    if (!input_result.ok())
+        throw std::runtime_error(input_result.status().ToString());
+    
+    std::shared_ptr<arrow::io::RandomAccessFile> input = *input_result;
 
     parquet_reader_ = parquet::ParquetFileReader::Open(input);
 
-    std::unique_ptr<parquet::arrow::FileReader> arrow_reader;
-    PARQUET_THROW_NOT_OK(parquet::arrow::OpenFile(input, pool));
-    arrow_reader_ = std::move(arrow_reader);
+    parquet::ArrowReaderProperties props;
+
+    //For Lineitem table
+    props.set_read_dictionary(14, true);
+    props.set_read_dictionary(13, true);
+    //For Part table
+    props.set_read_dictionary(3, true);
+    props.set_read_dictionary(6, true);
+
+    parquet::arrow::FileReaderBuilder builder;
+    PARQUET_THROW_NOT_OK(builder.Open(input));
+    builder.memory_pool(pool);
+    builder.properties(props);
+    PARQUET_THROW_NOT_OK(builder.Build(&arrow_reader_));
+}
+
+std::vector<int64_t> Table::readRawInt64Column(int row_group, int column_index, int64_t num_rows) {
+    auto rg_reader = parquet_reader_->RowGroup(row_group);
+    auto col_reader = std::static_pointer_cast<parquet::Int64Reader>(
+        rg_reader->Column(column_index)
+    );
+    std::vector<int64_t> values(num_rows);
+    int64_t values_read = 0;
+    col_reader->ReadBatch(num_rows, nullptr, nullptr, values.data(), &values_read);
+    values.resize(values_read);
+    return values;
+}
+
+std::shared_ptr<arrow::Table> Table::readRowGroup(int row_group, const std::vector<int>& columns) {
+    std::shared_ptr<arrow::Table> table;
+    arrow::Status st = arrow_reader_->RowGroup(row_group)->ReadTable(columns, &table);
+    if (!st.ok())
+        throw std::runtime_error(st.ToString());
+    return table;
 }
 
 ColumnStats Table::getColumnStats(int row_group, int col) const {
@@ -30,13 +64,28 @@ ColumnStats Table::getColumnStats(int row_group, int col) const {
     cs.column = col;
     cs.col_name = schema -> Column(col) -> name();
     cs.has_stats = false;
+    cs.has_bloom = col_meta->bloom_filter_offset().has_value();
+
+    //Fill bloom filter
+    if (cs.has_bloom){
+        auto& bloom_reader = parquet_reader_ -> GetBloomFilterReader();
+        auto row_bloom_reader = bloom_reader.RowGroup(row_group);
+        auto bloom_filter = row_bloom_reader->GetColumnBloomFilter(col);
+
+        if (bloom_filter) {
+            cs.bloom_filter = std::shared_ptr<parquet::BloomFilter>(std::move(bloom_filter));
+            cs.has_bloom = true;
+        } else {
+            cs.has_bloom = false;
+        }
+    }
 
     auto stats = col_meta -> statistics();
     if(!stats || !stats -> HasMinMax()){
         return cs;
     }
     cs.has_stats = true;
-
+    
     fillMinMax(cs, stats);
     return cs;
 }
@@ -154,6 +203,9 @@ void Table::printSchema() const {
     hline();
 }
 
+int64_t Table::rowGroupSize(int row_group) const {
+    return parquet_reader_->metadata()->RowGroup(row_group)->num_rows();
+}
 
 int Table::numRowGroups() const {
     return parquet_reader_ -> metadata() -> num_row_groups();
