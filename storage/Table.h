@@ -44,7 +44,4 @@ public:
 private:
     std::unique_ptr<parquet::ParquetFileReader> parquet_reader_;
     std::unique_ptr<parquet::arrow::FileReader> arrow_reader_;
-
-    template<typename T, typename StatsT>
-    void extractTypedStats(const std::shared_ptr<parquet::Statistics>& raw, ColumnStats& out) const;
 };

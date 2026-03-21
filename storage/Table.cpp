@@ -5,7 +5,6 @@
 #include <parquet/arrow/reader.h>
 #include <arrow/io/api.h>
 
-//Constructor
 Table::Table(const std::string& filename) {
     arrow::MemoryPool* pool = arrow::default_memory_pool();
 
@@ -22,6 +21,7 @@ Table::Table(const std::string& filename) {
     //For Lineitem table
     props.set_read_dictionary(14, true);
     props.set_read_dictionary(13, true);
+
     //For Part table
     props.set_read_dictionary(3, true);
     props.set_read_dictionary(6, true);

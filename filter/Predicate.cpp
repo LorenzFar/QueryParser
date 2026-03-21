@@ -1,30 +1,39 @@
 #include "Predicate.h"
-#include <arm_neon.h>
 #include <iostream>
 
-void Predicate::lineitem_filter_indices(const std::shared_ptr<arrow::Table>& rg, const int64_t* raw_partkey, const int64_t* raw_qty, int64_t count, const std::unordered_map<int64_t, uint8_t>& hash_table, std::vector<int64_t>& matching_indices) {
-    //int64_t total_int = 0;
+inline int8x16_t Predicate::narrow_i32x16(const int32_t* p) {
+    return vcombine_s8(
+        vmovn_s16(vcombine_s16(vmovn_s32(vld1q_s32(p)),    vmovn_s32(vld1q_s32(p+4)))),
+        vmovn_s16(vcombine_s16(vmovn_s32(vld1q_s32(p+8)),  vmovn_s32(vld1q_s32(p+12))))
+    );
+}
+
+inline uint8x16_t Predicate::match_any4(int8x16_t v, int8x16_t a, int8x16_t b, int8x16_t c, int8x16_t d) {
+    return vorrq_u8(vorrq_u8(vceqq_s8(v,a), vceqq_s8(v,b)),vorrq_u8(vceqq_s8(v,c), vceqq_s8(v,d)));
+}
+
+int32_t Predicate::find_dict_index(const arrow::StringArray* dict, const std::string_view target) {
+    for (int32_t i = 0; i < dict->length(); ++i)
+        if (dict->GetString(i) == target){
+            return i;
+        } 
+    return -1;
+}
+
+void Predicate::lineitem_filter_indices(const std::shared_ptr<arrow::Table>& rg, const int64_t* raw_partkey, const int64_t* raw_qty, int64_t count, const ankerl::unordered_dense::map<int64_t, uint8_t>& hash_table, std::vector<int64_t>& matching_indices) {
     matching_indices.clear();
+
     // --- dictionary lookup for shipinstruct ---
     auto col_instruct = rg->column(0);
     auto dict_instruct = arrow::internal::checked_cast<arrow::DictionaryArray*>(col_instruct->chunk(0).get());
     auto str_instruct  = arrow::internal::checked_cast<arrow::StringArray*>(dict_instruct->dictionary().get());
-    int32_t deliver_idx = -1;
-    for(int32_t i = 0; i < str_instruct->length(); ++i)
-        if(str_instruct->GetString(i) == "DELIVER IN PERSON") { deliver_idx = i; break; }
+    int32_t deliver_idx = find_dict_index(str_instruct, "DELIVER IN PERSON");
 
     // --- dictionary lookup for shipmode ---
     auto col_mode = rg->column(1);
     auto dict_mode = arrow::internal::checked_cast<arrow::DictionaryArray*>(col_mode->chunk(0).get());
     auto str_mode  = arrow::internal::checked_cast<arrow::StringArray*>(dict_mode->dictionary().get());
-    int32_t air_idx = -1;
-    for(int32_t i = 0; i < str_mode->length(); ++i) {
-        auto s = str_mode->GetString(i);
-        if(s == "AIR") {
-            air_idx   = i;
-            break;
-        }
-    }
+    int32_t air_idx = find_dict_index(str_mode, "AIR");
 
     const int32_t* raw_instruct = arrow::internal::checked_cast<arrow::Int32Array*>(dict_instruct->indices().get())->raw_values();
     const int32_t* raw_mode     = arrow::internal::checked_cast<arrow::Int32Array*>(dict_mode->indices().get())->raw_values();
@@ -35,18 +44,13 @@ void Predicate::lineitem_filter_indices(const std::shared_ptr<arrow::Table>& rg,
 
     int64_t i = 0;
 
-    for(; i + 16 <= count; i += 16) {
-        // narrow instruct int32 -> int8
-        int8x16_t ni = vcombine_s8(
-            vmovn_s16(vcombine_s16(vmovn_s32(vld1q_s32(raw_instruct+i)),   vmovn_s32(vld1q_s32(raw_instruct+i+4)))),
-            vmovn_s16(vcombine_s16(vmovn_s32(vld1q_s32(raw_instruct+i+8)), vmovn_s32(vld1q_s32(raw_instruct+i+12))))
-        );
+    constexpr int64_t kBrand1Min = 800,  kBrand1Max = 1800;
+    constexpr int64_t kBrand2Min = 1000, kBrand2Max = 2000;
+    constexpr int64_t kBrand3Min = 2400, kBrand3Max = 3400;
 
-        // narrow mode int32 -> int8
-        int8x16_t nm = vcombine_s8(
-            vmovn_s16(vcombine_s16(vmovn_s32(vld1q_s32(raw_mode+i)),   vmovn_s32(vld1q_s32(raw_mode+i+4)))),
-            vmovn_s16(vcombine_s16(vmovn_s32(vld1q_s32(raw_mode+i+8)), vmovn_s32(vld1q_s32(raw_mode+i+12))))
-        );
+    for(; i + 16 <= count; i += 16) {
+        int8x16_t ni = narrow_i32x16(raw_instruct + i);
+        int8x16_t nm = narrow_i32x16(raw_mode + i);
 
         // instruct = 'DELIVER IN PERSON'
         uint8x16_t instruct_match = vceqq_s8(ni, vdeliver);
@@ -71,18 +75,11 @@ void Predicate::lineitem_filter_indices(const std::shared_ptr<arrow::Table>& rg,
             // quantity check per brand
             int64_t qty = raw_qty[row];
             uint8_t brand = it->second;
-            bool match = (brand == 1 && qty >= 800  && qty <= 1800)
-              || (brand == 2 && qty >= 1000 && qty <= 2000)
-              || (brand == 3 && qty >= 2400  && qty <= 3400);
+            bool match = (brand == 1 && qty >= kBrand1Min  && qty <= kBrand1Max)
+              || (brand == 2 && qty >= kBrand2Min && qty <= kBrand2Max)
+              || (brand == 3 && qty >= kBrand3Min  && qty <= kBrand3Max);
 
             if(match){
-                // std::cerr << "partkey=" << raw_partkey[row]
-                // << " price=" << raw_price[row]
-                // << " discount=" << raw_discount[row]
-                // << " revenue=" << (raw_price[row] * (100 - raw_discount[row]))
-                // << std::endl;
-
-                //total_int += raw_price[row] * (100 - raw_discount[row]);
 
                 matching_indices.push_back(row);
             }
@@ -99,19 +96,11 @@ void Predicate::lineitem_filter_indices(const std::shared_ptr<arrow::Table>& rg,
 
         int64_t qty = raw_qty[i];
         uint8_t brand = it->second;
-        bool match = (brand == 1 && qty >= 800  && qty <= 1800)
-                      || (brand == 2 && qty >= 1000 && qty <= 2000)
-                      || (brand == 3 && qty >= 2400  && qty <= 3400);
+        bool match = (brand == 1 && qty >= kBrand1Min  && qty <= kBrand1Max)
+              || (brand == 2 && qty >= kBrand2Min && qty <= kBrand2Max)
+              || (brand == 3 && qty >= kBrand3Min  && qty <= kBrand3Max);
 
-        if(match) {
-            // std::cerr << "partkey=" << raw_partkey[i]
-            //   << " price=" << raw_price[i]
-            //   << " discount=" << raw_discount[i]
-            //   << " revenue=" << (raw_price[i] * (100 - raw_discount[i]))
-            //   << std::endl;
-
-            //total_int += raw_price[i] * (10000 - raw_discount[i]);
-            
+        if(match) {            
             matching_indices.push_back(i);
         }
     }
@@ -119,7 +108,7 @@ void Predicate::lineitem_filter_indices(const std::shared_ptr<arrow::Table>& rg,
     return;
 }
 
-void Predicate::part_filter(const std::shared_ptr<arrow::Table>& rg, std::unordered_map<int64_t, uint8_t>& hash_table) {
+void Predicate::part_filter(const std::shared_ptr<arrow::Table>& rg, ankerl::unordered_dense::map<int64_t, uint8_t>& hash_table) {
     
     auto brand_col = rg->column(1);
     auto brand_dict = arrow::internal::checked_cast<arrow::DictionaryArray*>(brand_col->chunk(0).get());
@@ -160,6 +149,21 @@ void Predicate::part_filter(const std::shared_ptr<arrow::Table>& rg, std::unorde
         else if(s == "LG PKG")   lg_pkg   = i;
     }
 
+    const BrandSpec brands[3] = {
+        { idx22,  5, 1 }, //Brand22
+        { idx23, 10, 2 }, //Brand23
+        { idx12, 15, 3 }, //Brand12
+    };
+
+    auto container_matches = [&](int32_t c, uint8_t brand_bits) -> bool {
+        switch (brand_bits) {
+            case 1: return c==sm_case  || c==sm_box  || c==sm_pack  || c==sm_pkg;
+            case 2: return c==med_bag  || c==med_box  || c==med_pkg  || c==med_pack;
+            case 3: return c==lg_case  || c==lg_box  || c==lg_pack  || c==lg_pkg;
+            default: return false;
+        }
+    };
+
     // --- Raw arrays ---
     auto* brand_idx     = arrow::internal::checked_cast<arrow::Int32Array*>(brand_dict->indices().get());
     auto* container_idx = arrow::internal::checked_cast<arrow::Int32Array*>(container_dict->indices().get());
@@ -194,30 +198,18 @@ void Predicate::part_filter(const std::shared_ptr<arrow::Table>& rg, std::unorde
 
     int64_t i = 0;
     for(; i + 16 <= count; i += 16) {
-        // narrow brand int32 -> int8
-        int8x16_t nb = vcombine_s8(
-            vmovn_s16(vcombine_s16(vmovn_s32(vld1q_s32(raw_brand+i)),    vmovn_s32(vld1q_s32(raw_brand+i+4)))),
-            vmovn_s16(vcombine_s16(vmovn_s32(vld1q_s32(raw_brand+i+8)),  vmovn_s32(vld1q_s32(raw_brand+i+12))))
-        );
-
-        // narrow container int32 -> int8
-        int8x16_t nc = vcombine_s8(
-            vmovn_s16(vcombine_s16(vmovn_s32(vld1q_s32(raw_container+i)),   vmovn_s32(vld1q_s32(raw_container+i+4)))),
-            vmovn_s16(vcombine_s16(vmovn_s32(vld1q_s32(raw_container+i+8)), vmovn_s32(vld1q_s32(raw_container+i+12))))
-        );
+        int8x16_t brand_vec     = narrow_i32x16(raw_brand + i);
+        int8x16_t container_vec = narrow_i32x16(raw_container + i);
 
         // brand matches
-        uint8x16_t match22 = vceqq_s8(nb, vb22);
-        uint8x16_t match23 = vceqq_s8(nb, vb23);
-        uint8x16_t match12 = vceqq_s8(nb, vb12);
+        uint8x16_t match22 = vceqq_s8(brand_vec, vb22);
+        uint8x16_t match23 = vceqq_s8(brand_vec, vb23);
+        uint8x16_t match12 = vceqq_s8(brand_vec, vb12);
 
         // container matches per brand group
-        uint8x16_t sm_match  = vorrq_u8(vorrq_u8(vceqq_s8(nc, vsm_case),  vceqq_s8(nc, vsm_box)),
-                                         vorrq_u8(vceqq_s8(nc, vsm_pack),  vceqq_s8(nc, vsm_pkg)));
-        uint8x16_t med_match = vorrq_u8(vorrq_u8(vceqq_s8(nc, vmed_bag),  vceqq_s8(nc, vmed_box)),
-                                         vorrq_u8(vceqq_s8(nc, vmed_pkg),  vceqq_s8(nc, vmed_pack)));
-        uint8x16_t lg_match  = vorrq_u8(vorrq_u8(vceqq_s8(nc, vlg_case),  vceqq_s8(nc, vlg_box)),
-                                         vorrq_u8(vceqq_s8(nc, vlg_pack),  vceqq_s8(nc, vlg_pkg)));
+        uint8x16_t sm_match  = match_any4(container_vec, vsm_case,  vsm_box,  vsm_pack,  vsm_pkg);
+        uint8x16_t med_match = match_any4(container_vec, vmed_bag,  vmed_box, vmed_pkg,  vmed_pack);
+        uint8x16_t lg_match  = match_any4(container_vec, vlg_case,  vlg_box,  vlg_pack,  vlg_pkg);
 
         // brand AND container
         uint8x16_t cand22 = vandq_u8(match22, sm_match);
@@ -232,20 +224,15 @@ void Predicate::part_filter(const std::shared_ptr<arrow::Table>& rg, std::unorde
         vst1q_u8(lanes, any);
         for(int l = 0; l < 16; ++l) {
             if(!lanes[l]) continue;
-            int64_t idx = i + l;
-            int32_t size = raw_size[idx];
+            int64_t row = i + l;
+            int32_t b   = raw_brand[row];
+            int32_t s   = raw_size[row];
 
-            // size check per brand
-            uint8_t which = lanes[l]; // 0xFF
-            bool ok = false;
-            if(raw_brand[idx] == idx22 && size >= 1 && size <= 5)  ok = true;
-            if(raw_brand[idx] == idx23 && size >= 1 && size <= 10) ok = true;
-            if(raw_brand[idx] == idx12 && size >= 1 && size <= 15) ok = true;
-
-            if(ok) {
-                uint8_t brand_bits = (raw_brand[idx] == idx22) ? 1 :
-                                     (raw_brand[idx] == idx23) ? 2 : 3;
-                hash_table[raw_partkey[idx]] = brand_bits;
+            for (const auto& spec : brands) {
+                if (b == spec.dict_idx && s >= 1 && s <= spec.max_size) {
+                    hash_table[raw_partkey[row]] = spec.brand_bits;
+                    break;
+                }
             }
         }
     }
@@ -254,19 +241,19 @@ void Predicate::part_filter(const std::shared_ptr<arrow::Table>& rg, std::unorde
         int32_t b = raw_brand[i];
         int32_t c = raw_container[i];
         int32_t s = raw_size[i];
-        bool ok = false;
-        if(b == idx22 && (c==sm_case||c==sm_box||c==sm_pack||c==sm_pkg) && s>=1 && s<=5)  ok=true;
-        if(b == idx23 && (c==med_bag||c==med_box||c==med_pkg||c==med_pack) && s>=1 && s<=10) ok=true;
-        if(b == idx12 && (c==lg_case||c==lg_box||c==lg_pack||c==lg_pkg) && s>=1 && s<=15) ok=true;
-        if(ok) {
-            uint8_t brand_bits = (b==idx22)?1:(b==idx23)?2:3;
-            hash_table[raw_partkey[i]] = brand_bits;
+
+        for (const auto& spec : brands) {
+            if (b == spec.dict_idx && s >= 1 && s <= spec.max_size
+                && container_matches(c, spec.brand_bits)) {
+                hash_table[raw_partkey[i]] = spec.brand_bits;
+                break;
+            }
         }
     }
 }
 
 bool Predicate::shouldScanRowGroup(const Table& table, size_t rg) {
-    auto stats = table.getColumnStats(rg, 3); // example: l_shipmode
+    auto stats = table.getColumnStats(rg, 3); // example: l_shipmode 
 
     std::cout << stats.col_name << '\n';
 
