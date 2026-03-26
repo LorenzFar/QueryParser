@@ -1,9 +1,4 @@
 #include "Table.h"
-#include <iostream>
-#include <stdexcept>
-#include <parquet/column_reader.h>
-#include <parquet/arrow/reader.h>
-#include <arrow/io/api.h>
 
 Table::Table(const std::string& filename) {
     arrow::MemoryPool* pool = arrow::default_memory_pool();
@@ -51,105 +46,6 @@ std::shared_ptr<arrow::Table> Table::readRowGroup(int row_group, const std::vect
     if (!st.ok())
         throw std::runtime_error(st.ToString());
     return table;
-}
-
-ColumnStats Table::getColumnStats(int row_group, int col) const {
-    auto file_meta = parquet_reader_ -> metadata();
-    auto rg_meta = file_meta -> RowGroup(row_group);
-    auto col_meta = rg_meta -> ColumnChunk(col);
-    auto schema = file_meta -> schema();
-
-    ColumnStats cs;
-    cs.row_group = row_group;
-    cs.column = col;
-    cs.col_name = schema -> Column(col) -> name();
-    cs.has_stats = false;
-    cs.has_bloom = col_meta->bloom_filter_offset().has_value();
-
-    //Fill bloom filter
-    if (cs.has_bloom){
-        auto& bloom_reader = parquet_reader_ -> GetBloomFilterReader();
-        auto row_bloom_reader = bloom_reader.RowGroup(row_group);
-        auto bloom_filter = row_bloom_reader->GetColumnBloomFilter(col);
-
-        if (bloom_filter) {
-            cs.bloom_filter = std::shared_ptr<parquet::BloomFilter>(std::move(bloom_filter));
-            cs.has_bloom = true;
-        } else {
-            cs.has_bloom = false;
-        }
-    }
-
-    auto stats = col_meta -> statistics();
-    if(!stats || !stats -> HasMinMax()){
-        return cs;
-    }
-    cs.has_stats = true;
-    
-    fillMinMax(cs, stats);
-    return cs;
-}
-
-std::vector<ColumnStats> Table:: getRowGroupStats(int row_group) const {
-    std::vector<ColumnStats> result;
-    int num_cols = numColumns();
-
-    result.reserve(num_cols);
-
-    for(int columns = 0; columns < num_cols; ++columns){
-        result.push_back(getColumnStats(row_group, columns));
-    }
-    return result;
-}
-
-std::vector<ColumnStats> Table::getAllStats() const {
-    std::vector<ColumnStats> result;
-    int num_row_group = numRowGroups();
-    int num_column = numColumns();
-
-    result.reserve(num_row_group * num_column);
-
-    for(int row_group = 0; row_group < num_row_group; ++row_group){
-        for(int column = 0; column < num_column; ++column){
-            result.push_back(getColumnStats(row_group, column));
-        }
-    }
-    return result;
-}
-
-void Table::fillMinMax(ColumnStats& cs, const std::shared_ptr<parquet::Statistics>& stats) const {
-    switch (stats->physical_type()) { 
-        case parquet::Type::INT32: { 
-            auto s = std::static_pointer_cast<parquet::TypedStatistics<parquet::Int32Type>>(stats); 
-            cs.min_val = s->min(); 
-            cs.max_val = s->max(); break; 
-        } 
-        case parquet::Type::INT64: { 
-            auto s = std::static_pointer_cast<parquet::TypedStatistics<parquet::Int64Type>>(stats); 
-            cs.min_val = s->min(); 
-            cs.max_val = s->max(); break; 
-        } 
-        case parquet::Type::FLOAT: { 
-            auto s = std::static_pointer_cast<parquet::TypedStatistics<parquet::FloatType>>(stats); 
-            cs.min_val = s->min();
-            cs.max_val = s->max();
-            break; 
-        } 
-        case parquet::Type::DOUBLE: { 
-            auto s = std::static_pointer_cast<parquet::TypedStatistics<parquet::DoubleType>>(stats); 
-            cs.min_val = s->min();
-            cs.max_val = s->max(); 
-            break; 
-        } 
-        case parquet::Type::BYTE_ARRAY: { 
-            auto s = std::static_pointer_cast<parquet::TypedStatistics<parquet::ByteArrayType>>(stats); 
-            cs.min_val = s->min().ptr ? std::string(reinterpret_cast<const char*>(s->min().ptr), s->min().len) : ""; 
-            cs.max_val = s->max().ptr ? std::string(reinterpret_cast<const char*>(s->max().ptr), s->max().len) : ""; 
-            break; 
-        } 
-        default:
-            cs.has_stats = false; 
-    }
 }
 
 void Table::printSchema() const {

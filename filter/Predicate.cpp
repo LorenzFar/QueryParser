@@ -1,5 +1,4 @@
 #include "Predicate.h"
-#include <iostream>
 
 inline int8x16_t Predicate::narrow_i32x16(const int32_t* p) {
     return vcombine_s8(
@@ -14,7 +13,7 @@ inline uint8x16_t Predicate::match_any4(int8x16_t v, int8x16_t a, int8x16_t b, i
 
 int32_t Predicate::find_dict_index(const arrow::StringArray* dict, const std::string_view target) {
     for (int32_t i = 0; i < dict->length(); ++i)
-        if (dict->GetString(i) == target){
+        if (dict->GetView(i) == target){
             return i;
         } 
     return -1;
@@ -104,8 +103,6 @@ void Predicate::lineitem_filter_indices(const std::shared_ptr<arrow::Table>& rg,
             matching_indices.push_back(i);
         }
     }
-
-    return;
 }
 
 void Predicate::part_filter(const std::shared_ptr<arrow::Table>& rg, ankerl::unordered_dense::map<int64_t, uint8_t>& hash_table) {
@@ -116,7 +113,7 @@ void Predicate::part_filter(const std::shared_ptr<arrow::Table>& rg, ankerl::uno
     
     int32_t idx22 = -1, idx23 = -1, idx12 = -1;
     for(int32_t i = 0; i < brand_str->length(); ++i) {
-        auto s = brand_str->GetString(i);
+        auto s = brand_str->GetView(i);
         if(s == "Brand#22") idx22 = i;
         else if(s == "Brand#23") idx23 = i;
         else if(s == "Brand#12") idx12 = i;
@@ -134,7 +131,7 @@ void Predicate::part_filter(const std::shared_ptr<arrow::Table>& rg, ankerl::uno
     int32_t lg_case=-1, lg_box=-1, lg_pack=-1, lg_pkg=-1;
 
     for(int32_t i = 0; i < container_str->length(); ++i) {
-        auto s = container_str->GetString(i);
+        auto s = container_str->GetView(i);
         if(s == "SM CASE")  sm_case  = i;
         else if(s == "SM BOX")   sm_box   = i;
         else if(s == "SM PACK")  sm_pack  = i;
@@ -148,12 +145,6 @@ void Predicate::part_filter(const std::shared_ptr<arrow::Table>& rg, ankerl::uno
         else if(s == "LG PACK")  lg_pack  = i;
         else if(s == "LG PKG")   lg_pkg   = i;
     }
-
-    const BrandSpec brands[3] = {
-        { idx22,  5, 1 }, //Brand22
-        { idx23, 10, 2 }, //Brand23
-        { idx12, 15, 3 }, //Brand12
-    };
 
     auto container_matches = [&](int32_t c, uint8_t brand_bits) -> bool {
         switch (brand_bits) {
@@ -219,75 +210,33 @@ void Predicate::part_filter(const std::shared_ptr<arrow::Table>& rg, ankerl::uno
         // any candidate
         uint8x16_t any = vorrq_u8(vorrq_u8(cand22, cand23), cand12);
 
-        // extract matching lanes for size check + hash table insert
-        uint8_t lanes[16];
-        vst1q_u8(lanes, any);
-        for(int l = 0; l < 16; ++l) {
-            if(!lanes[l]) continue;
-            int64_t row = i + l;
-            int32_t b   = raw_brand[row];
-            int32_t s   = raw_size[row];
+        uint8_t lanes22[16], lanes23[16], lanes12[16], any_lanes[16];
+        vst1q_u8(lanes22, cand22);
+        vst1q_u8(lanes23, cand23);
+        vst1q_u8(lanes12, cand12);
+        vst1q_u8(any_lanes, any);
 
-            for (const auto& spec : brands) {
-                if (b == spec.dict_idx && s >= 1 && s <= spec.max_size) {
-                    hash_table[raw_partkey[row]] = spec.brand_bits;
-                    break;
-                }
-            }
+        for(int l = 0; l < 16; ++l) {
+            if (!any_lanes[l]) continue;
+
+            int64_t row = i + l;
+            int32_t s   = raw_size[row];
+            int64_t key = raw_partkey[row];
+
+            if      (lanes22[l] && s <= 5)  hash_table[key] = 1;
+            else if (lanes23[l] && s <= 10) hash_table[key] = 2;
+            else if (lanes12[l] && s <= 15) hash_table[key] = 3;
         }
     }
 
     for(; i < count; ++i) {
         int32_t b = raw_brand[i];
-        int32_t c = raw_container[i];
         int32_t s = raw_size[i];
+        int64_t key = raw_partkey[i];
 
-        for (const auto& spec : brands) {
-            if (b == spec.dict_idx && s >= 1 && s <= spec.max_size
-                && container_matches(c, spec.brand_bits)) {
-                hash_table[raw_partkey[i]] = spec.brand_bits;
-                break;
-            }
-        }
+        if      (b == idx22 && s <= 5  && container_matches(raw_container[i], 1)) hash_table[key] = 1;
+        else if (b == idx23 && s <= 10 && container_matches(raw_container[i], 2)) hash_table[key] = 2;
+        else if (b == idx12 && s <= 15 && container_matches(raw_container[i], 3)) hash_table[key] = 3;
     }
-}
-
-bool Predicate::shouldScanRowGroup(const Table& table, size_t rg) {
-    auto stats = table.getColumnStats(rg, 3); // example: l_shipmode 
-
-    std::cout << stats.col_name << '\n';
-
-    // std::cout << "Min: ";
-    // std::visit([](auto&& val){ std::cout << val; }, stats.min_val);
-    // std::cout << "\n";
-
-    // std::cout << "Max: ";
-    // std::visit([](auto&& val){ std::cout << val; }, stats.max_val);
-    // std::cout << "\n";
-
-    //Check if the Row has bloom filter + if a AIR exist inside
-    if (stats.has_bloom && stats.bloom_filter) {
-        checkBloomFilter("Brand#12", stats.bloom_filter);
-    }
-
-    return true;
-}
-
-bool Predicate::checkBloomFilter(const std::string& probe, const std::shared_ptr<parquet::BloomFilter>& bloom_filter){
-    if (!bloom_filter) return true;  
-
-    parquet::ByteArray arr;
-    arr.ptr = reinterpret_cast<const uint8_t*>(probe.data());
-    arr.len = static_cast<uint32_t>(probe.size());
-
-    uint64_t hash        = bloom_filter->Hash(&arr);   
-    bool     might_exist = bloom_filter->FindHash(hash);
-
-    std::cout << "Bloom filter says '" << probe << "' "
-              << (might_exist ? "MIGHT exist — scan row group"
-                              : "definitely NOT here — skip row group")
-              << '\n';
-
-    return might_exist;
 }
 
