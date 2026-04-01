@@ -1,15 +1,8 @@
+import sys
+import os
+import csv
 import duckdb
 import time
-import csv
-
-SCALE_FACTORS = [
-    ("0.5", "./sf0.5/"),
-    ("1",   "./sf1/"),
-    ("2",   "./sf2/"),
-    ("5",   "./sf5/"),
-    ("10",   "./sf10/"),
-    ("20", "./sf20/")
-]
 
 WARMUP_RUNS = 3
 TIMED_RUNS  = 10
@@ -18,14 +11,14 @@ QUERY = """
 SELECT
     SUM(l_extendedprice * (1 - l_discount)) AS revenue
 FROM
-    read_parquet('{lineitem}lineitem.parquet'),
-    read_parquet('{part}part.parquet')
+    read_parquet('{lineitem}'),
+    read_parquet('{part}')
 WHERE
     (
         p_partkey = l_partkey
         and p_brand = 'Brand#22'
         and p_container in ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')
-        and l_quantity >= 8 and l_quantity <= 8 + 10
+        and l_quantity >= 8 and l_quantity <= 18
         and p_size between 1 and 5
         and l_shipmode in ('AIR', 'AIR REG')
         and l_shipinstruct = 'DELIVER IN PERSON'
@@ -35,7 +28,7 @@ WHERE
         p_partkey = l_partkey
         and p_brand = 'Brand#23'
         and p_container in ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')
-        and l_quantity >= 10 and l_quantity <= 10 + 10
+        and l_quantity >= 10 and l_quantity <= 20
         and p_size between 1 and 10
         and l_shipmode in ('AIR', 'AIR REG')
         and l_shipinstruct = 'DELIVER IN PERSON'
@@ -45,74 +38,58 @@ WHERE
         p_partkey = l_partkey
         and p_brand = 'Brand#12'
         and p_container in ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')
-        and l_quantity >= 24 and l_quantity <= 24 + 10
+        and l_quantity >= 24 and l_quantity <= 34
         and p_size between 1 and 15
         and l_shipmode in ('AIR', 'AIR REG')
         and l_shipinstruct = 'DELIVER IN PERSON'
     );
 """
 
-def run_benchmark(sf_label, sf_path):
+def run_benchmark(sf_path):
     con = duckdb.connect()
     con.execute("PRAGMA threads=1")
-    query = QUERY.format(lineitem=sf_path, part=sf_path)
+
+    lineitem_file = os.path.join(sf_path, "lineitem.parquet")
+    part_file     = os.path.join(sf_path, "part.parquet")
+
+    query = QUERY.format(lineitem=lineitem_file, part=part_file)
 
     timed_s = []
-    revenue  = None
+    result = None
     for run in range(WARMUP_RUNS + TIMED_RUNS):
-        t_start = time.perf_counter()
-        result  = con.execute(query).fetchone()
-        t_end   = time.perf_counter()
+        t_start = time.time()
+        result = con.execute(query).fetchone()
+        t_end = time.time()
         if run >= WARMUP_RUNS:
             timed_s.append(t_end - t_start)
-            revenue = result[0]
+
     con.close()
 
     avg_s = sum(timed_s) / len(timed_s)
-    print(f"Completed DuckDB SF {sf_label}")
-    return avg_s, revenue
+    return avg_s, result[0]
 
 if __name__ == "__main__":
-    # read existing CSV rows written by C++
+    if len(sys.argv) < 2:
+        print("Usage: python run_benchmark.py <sf_path>")
+        sys.exit(1)
+
+    sf_path = sys.argv[1]
+    csv_name = sys.argv[2]
+
     rows = []
-    with open("results.csv", "r") as f:
+    with open(csv_name, "r") as f:
         reader = csv.DictReader(f)
         for row in reader:
             rows.append(row)
 
-    # run duckdb and merge
-    duckdb_results = {}
-    for sf_label, sf_path in SCALE_FACTORS:
-        avg_s, revenue = run_benchmark(sf_label, sf_path)
-        duckdb_results[sf_label] = (avg_s, revenue)
+    duck_time, duck_revenue = run_benchmark(sf_path)
 
-    # rewrite CSV with all columns filled
-    with open("results.csv", "w", newline="") as f:
+    with open(csv_name, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([
-            "SF",
-            "Average Time (Optimised)",
-            "Average Time (DuckDB)",
-            "Revenue (Optimised)",
-            "Revenue (DuckDB)",
-            "Time Improvement",
-            "Difference"
-        ])
+        writer.writerow(["Result (Optimised)", "Result (DuckDB)"])
         for row in rows:
-            sf         = row["SF"]
-            opt_time   = float(row["Average Time (Optimised)"])
-            opt_rev    = float(row["Revenue (Optimised)"])
-            duck_time, duck_rev = duckdb_results[sf]
-            improvement = duck_time - opt_time
-            difference  = (duck_time - opt_time) / duck_time * 100
-            writer.writerow([
-                sf,
-                f"{opt_time:.4f}",
-                f"{duck_time:.4f}",
-                f"{opt_rev:.4f}",
-                f"{duck_rev:.4f}",
-                f"{improvement:.4f}",
-                f"{difference:.2f}%"
-            ])
+            opt_rev  = float(row["Result (Optimised)"])
+            writer.writerow([f"{opt_rev:.4f}", f"{duck_revenue:.4f}"])
 
-    print("\nResults written to results.csv")
+    # Print only the average time as last line
+    print(f"{duck_time:.4f}")

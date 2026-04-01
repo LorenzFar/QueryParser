@@ -17,6 +17,7 @@ public:
     void printSchema() const;
 
     int64_t rowGroupSize(int row_group) const;
+    int64_t numRows() const;
     int numRowGroups() const;
     int numColumns() const;
 

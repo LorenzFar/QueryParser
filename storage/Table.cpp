@@ -107,6 +107,10 @@ int Table::numRowGroups() const {
     return parquet_reader_ -> metadata() -> num_row_groups();
 }
 
+int64_t Table::numRows() const {
+    return parquet_reader_ -> metadata() -> num_rows();
+}
+
 int Table::numColumns() const {
     return parquet_reader_ -> metadata() -> num_columns();
 }

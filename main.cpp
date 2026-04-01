@@ -15,7 +15,7 @@ struct RunResult {
     double  revenue;
 };
 
-RunResult run_once(const std::string& sf_path, double sf) {
+RunResult run_once(const std::string& sf_path) {
     RunResult r{};
 
     auto start = Clock::now();
@@ -26,6 +26,8 @@ RunResult run_once(const std::string& sf_path, double sf) {
     auto t1 = Clock::now();
 
     ankerl::unordered_dense::map<int64_t, uint8_t> hash_table;
+    
+    double sf = static_cast<double>(part_table.numRows()) / 200000.0;
     hash_table.reserve(static_cast<size_t>(sf * 512 * 1.5));
 
     for (int i = 0; i < part_table.numRowGroups(); ++i) {
@@ -77,51 +79,56 @@ RunResult run_once(const std::string& sf_path, double sf) {
     return r;
 }
 
-int main() {
-    const std::vector<std::tuple<std::string, std::string, double>> scale_factors = {
-        { "sf0.5", "0.5", 0.5 },
-        { "sf1",   "1",   1.0 },
-        { "sf2",   "2",   2.0 },
-        { "sf5",   "5",   5.0 },
-        { "sf10",   "10",   10.0 },
-        { "sf20",   "20",   20.0 }
-    };
-
+int main(int argc, char** argv) {
     constexpr int WARMUP_RUNS = 3;
     constexpr int TIMED_RUNS  = 10;
     constexpr int TOTAL_RUNS  = WARMUP_RUNS + TIMED_RUNS;
 
-    std::ofstream csv("results.csv");
-    csv << "SF,Average Time (Optimised),Average Time (DuckDB),Revenue (Optimised),Revenue (DuckDB),Time Improvement,Difference\n";
-
-    for (const auto& [path, label, sf] : scale_factors) {
-
-        int64_t total_time = 0;
-        double final_revenue = 0;
-
-        for (int run = 0; run < TOTAL_RUNS; ++run) {
-            try {
-                auto result = run_once(path, sf);
-                if (run >= WARMUP_RUNS){
-                    total_time += result.total;
-                    final_revenue = result.revenue;
-                }
-            } catch (const std::exception& e) {
-                std::cerr << "Error on SF " << label << " run " << run << ": " << e.what() << "\n";
-                break;
-            }
-        }
-
-        csv << label << ","                                                          // SF
-        << std::fixed << std::setprecision(4) << (total_time / 1e6 / TIMED_RUNS) << ","  // opt time
-        << ","                                                                   // duckdb time
-        << final_revenue << ","                                                  // opt revenue
-        << ","                                                                   // duckdb revenue
-        << ","                                                                   // improvement
-        << "\n";                                                                 // difference (last, no trailing comma)
-        std::cout << "Completed SF " << label << "\n";
+    if (argc < 3) {
+        std::cerr << "Usage: " << argv[0]
+                  << " --data <path> [--out <csv>]\n";
+        return 1;
     }
 
-    //Call Python code
-    return 0;
+    std::string path;
+    std::string out_file = "results.csv";
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+
+        if (arg == "--data" && i + 1 < argc) {
+            path = argv[++i];
+        } else if (arg == "--out" && i + 1 < argc) {
+            out_file = argv[++i];
+        }
+    }
+
+    if (path.empty()) {
+        std::cerr << "--data is required\n";
+        return 1;
+    }
+
+    std::ofstream csv(out_file);
+    csv << "Result (Optimised),Result (DuckDB)\n";
+
+    int64_t total_time = 0;
+    double final_revenue = 0;
+
+    for (int run = 0; run < TOTAL_RUNS; ++run) {
+        try {
+            auto result = run_once(path);
+            if (run >= WARMUP_RUNS) {
+                total_time += result.total;
+                final_revenue = result.revenue;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Error on run " << run << ": " << e.what() << "\n";
+            break;
+        }
+    }
+
+    csv << std::fixed << std::setprecision(4) << final_revenue << ",,\n";
+
+    std::cout << std::fixed << std::setprecision(4)
+              << (total_time / 1e6 / TIMED_RUNS) << "\n";
 }
