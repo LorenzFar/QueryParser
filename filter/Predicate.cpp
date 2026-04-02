@@ -19,8 +19,28 @@ int32_t Predicate::find_dict_index(const arrow::StringArray* dict, const std::st
     return -1;
 }
 
+inline uint16_t extract_bitmask(uint8x16_t mask) {
+    // Shift each lane right by 7 to isolate the high bit (0x00 or 0x01).
+    uint8x16_t hi = vshrq_n_u8(mask, 7);
+
+    // Pack into two uint64 lanes.
+    uint64x2_t w = vreinterpretq_u64_u8(hi);
+    uint64_t lo64 = vgetq_lane_u64(w, 0);  // lanes 0-7
+    uint64_t hi64 = vgetq_lane_u64(w, 1);  // lanes 8-15
+
+    // Each byte in lo64/hi64 is 0 or 1; compress 8 bytes → 8 bits via
+    // multiplying by a magic constant that gathers bit 0 of each byte
+    // into the top byte, then shift down.
+    // Equivalent to: bit i = byte i & 1, packed into positions 0-7.
+    constexpr uint64_t kGather = 0x0102040810204080ULL;
+    uint8_t lo8 = static_cast<uint8_t>((lo64 * kGather) >> 56);
+    uint8_t hi8 = static_cast<uint8_t>((hi64 * kGather) >> 56);
+    return static_cast<uint16_t>(lo8) | (static_cast<uint16_t>(hi8) << 8);
+}
+
 void Predicate::lineitem_filter_indices(const std::shared_ptr<arrow::Table>& rg, const int64_t* raw_partkey, const int64_t* raw_qty, int64_t count, const ankerl::unordered_dense::map<int64_t, uint8_t>& hash_table, std::vector<int64_t>& matching_indices) {
     matching_indices.clear();
+    matching_indices.reserve(count / 8);
 
     // --- dictionary lookup for shipinstruct ---
     auto col_instruct = rg->column(0);
@@ -41,47 +61,40 @@ void Predicate::lineitem_filter_indices(const std::shared_ptr<arrow::Table>& rg,
     const int8x16_t vdeliver = vdupq_n_s8((int8_t)deliver_idx);
     const int8x16_t vair     = vdupq_n_s8((int8_t)air_idx);
 
-    int64_t i = 0;
-
     constexpr int64_t kBrand1Min = 800,  kBrand1Max = 1800;
     constexpr int64_t kBrand2Min = 1000, kBrand2Max = 2000;
     constexpr int64_t kBrand3Min = 2400, kBrand3Max = 3400;
 
+    int64_t i = 0;
     for(; i + 16 <= count; i += 16) {
         int8x16_t ni = narrow_i32x16(raw_instruct + i);
         int8x16_t nm = narrow_i32x16(raw_mode + i);
 
-        // instruct = 'DELIVER IN PERSON'
-        uint8x16_t instruct_match = vceqq_s8(ni, vdeliver);
+        uint8x16_t pass = vandq_u8(vceqq_s8(ni, vdeliver), vceqq_s8(nm, vair));
 
-        // mode = 'AIR'
-        uint8x16_t mode_match = vceqq_s8(nm, vair); 
+        uint16_t bits = extract_bitmask(pass);
+        if (!bits) continue;
 
-        // combine
-        uint8x16_t pass = vandq_u8(instruct_match, mode_match);
-
-        // extract lanes for hash probe + quantity check
-        uint8_t lanes[16];
-        vst1q_u8(lanes, pass);
-        for(int l = 0; l < 16; ++l) {
-            if(!lanes[l]) continue;
+        while (bits) {
+            int l = __builtin_ctz(bits);  // index of lowest set bit
+            bits &= bits - 1;             // clear lowest set bit
+ 
             int64_t row = i + l;
-
-            // hash probe
+ 
             auto it = hash_table.find(raw_partkey[row]);
-            if(it == hash_table.end()) continue;
-
-            // quantity check per brand
-            int64_t qty = raw_qty[row];
+            if (it == hash_table.end()) continue;
+ 
+            int64_t qty   = raw_qty[row];
             uint8_t brand = it->second;
-            bool match = (brand == 1 && qty >= kBrand1Min  && qty <= kBrand1Max)
-              || (brand == 2 && qty >= kBrand2Min && qty <= kBrand2Max)
-              || (brand == 3 && qty >= kBrand3Min  && qty <= kBrand3Max);
-
-            if(match){
-
+ 
+            // OPT: Simplified branching — single compound expression.
+            bool match =
+                (brand == 1 && qty >= kBrand1Min && qty <= kBrand1Max) ||
+                (brand == 2 && qty >= kBrand2Min && qty <= kBrand2Max) ||
+                (brand == 3 && qty >= kBrand3Min && qty <= kBrand3Max);
+ 
+            if (match)
                 matching_indices.push_back(row);
-            }
         }
     }
 
@@ -146,15 +159,6 @@ void Predicate::part_filter(const std::shared_ptr<arrow::Table>& rg, ankerl::uno
         else if(s == "LG PKG")   lg_pkg   = i;
     }
 
-    auto container_matches = [&](int32_t c, uint8_t brand_bits) -> bool {
-        switch (brand_bits) {
-            case 1: return c==sm_case  || c==sm_box  || c==sm_pack  || c==sm_pkg;
-            case 2: return c==med_bag  || c==med_box  || c==med_pkg  || c==med_pack;
-            case 3: return c==lg_case  || c==lg_box  || c==lg_pack  || c==lg_pkg;
-            default: return false;
-        }
-    };
-
     // --- Raw arrays ---
     auto* brand_idx     = arrow::internal::checked_cast<arrow::Int32Array*>(brand_dict->indices().get());
     auto* container_idx = arrow::internal::checked_cast<arrow::Int32Array*>(container_dict->indices().get());
@@ -210,24 +214,39 @@ void Predicate::part_filter(const std::shared_ptr<arrow::Table>& rg, ankerl::uno
         // any candidate
         uint8x16_t any = vorrq_u8(vorrq_u8(cand22, cand23), cand12);
 
-        uint8_t lanes22[16], lanes23[16], lanes12[16], any_lanes[16];
-        vst1q_u8(lanes22, cand22);
-        vst1q_u8(lanes23, cand23);
-        vst1q_u8(lanes12, cand12);
-        vst1q_u8(any_lanes, any);
+        uint16_t any_bits = extract_bitmask(any);
+        if (!any_bits) continue;
 
-        for(int l = 0; l < 16; ++l) {
-            if (!any_lanes[l]) continue;
+        uint16_t bits22 = extract_bitmask(cand22);
+        uint16_t bits23 = extract_bitmask(cand23);
+        uint16_t bits12 = extract_bitmask(cand12);
 
+        uint16_t bits = any_bits;
+        while (bits) {
+            int l = __builtin_ctz(bits);
+            bits &= bits - 1;
+ 
             int64_t row = i + l;
             int32_t s   = raw_size[row];
             int64_t key = raw_partkey[row];
-
-            if      (lanes22[l] && s <= 5)  hash_table[key] = 1;
-            else if (lanes23[l] && s <= 10) hash_table[key] = 2;
-            else if (lanes12[l] && s <= 15) hash_table[key] = 3;
+ 
+            uint16_t lane_bit = 1u << l;
+ 
+            // OPT: Bitwise lane check instead of array lookup.
+            if      ((bits22 & lane_bit) && s <= 5)  hash_table[key] = 1;
+            else if ((bits23 & lane_bit) && s <= 10) hash_table[key] = 2;
+            else if ((bits12 & lane_bit) && s <= 15) hash_table[key] = 3;
         }
     }
+
+    auto container_matches = [&](int32_t c, uint8_t brand_bits) -> bool {
+        switch (brand_bits) {
+            case 1: return c==sm_case  || c==sm_box  || c==sm_pack  || c==sm_pkg;
+            case 2: return c==med_bag  || c==med_box  || c==med_pkg  || c==med_pack;
+            case 3: return c==lg_case  || c==lg_box  || c==lg_pack  || c==lg_pkg;
+            default: return false;
+        }
+    };
 
     for(; i < count; ++i) {
         int32_t b = raw_brand[i];
